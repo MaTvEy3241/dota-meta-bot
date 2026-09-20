@@ -22,6 +22,7 @@ import logging
 import os
 import difflib
 import re
+import re
 from typing import Optional
 from bs4 import BeautifulSoup
 
@@ -88,6 +89,8 @@ def load_font(path: str, size: int, fallback_path: str = None) -> ImageFont.Free
 # Кэш данных из OpenDota (герои, предметы, патчи, иконки).
 # Обновляется при старте и раз в 6 часов.
 # ---------------------------------------------------------------------------
+
+CUSTOM_EMOJI_BY_HERO = {}
 
 CACHE = {
     "heroes": {},          # hero_id -> {name, localized_name, primary_attr, roles}
@@ -205,6 +208,27 @@ def _number(value: str) -> int:
         return 0
 
 
+
+def clean_hero_name(raw: str) -> str:
+    """Оставляет только одно нормальное название героя."""
+    text = raw or ""
+    alt_names = re.findall(r"!\[([^]]+)\]", text)
+    if alt_names:
+        text = alt_names[-1]
+    text = re.sub(r"Image\s*\d+\s*:\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"!\[([^]]*)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"\[([^]]+)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"https?://\S+", "", text)
+    text = BeautifulSoup(text, "html.parser").get_text(" ", strip=True)
+    text = re.sub(r"\s+", " ", text).strip()
+    words = text.split()
+    if len(words) % 2 == 0:
+        half = len(words) // 2
+        if words[:half] == words[half:]:
+            text = " ".join(words[:half])
+    return text
+
+
 def parse_dotabuff_hero_table(content: str) -> list:
     # Вариант 1: настоящий HTML DOTABUFF.
     soup = BeautifulSoup(content, "html.parser")
@@ -248,14 +272,7 @@ def parse_dotabuff_hero_table(content: str) -> list:
         parts = [p.strip() for p in line.strip("|").split("|")]
         if len(parts) < 5:
             continue
-        # Jina Reader иногда превращает ячейку Hero в Markdown-ссылку с
-        # картинкой. В Telegram нам нужно оставить только название героя.
-        raw_name = parts[0]
-        raw_name = re.sub(r"!\[([^]]*)\]\([^)]*\)", r"\1", raw_name)
-        raw_name = re.sub(r"\[([^]]+)\]\([^)]*\)", r"\1", raw_name)
-        raw_name = re.sub(r"https?://\S+", "", raw_name)
-        raw_name = re.sub(r"^Image\s*\d+\s*:\s*", "", raw_name, flags=re.IGNORECASE)
-        name = BeautifulSoup(raw_name, "html.parser").get_text(" ", strip=True).strip()
+        name = clean_hero_name(parts[0])
         # Обычно: Hero | Tier | Win rate | Change | Pick rate | Change | Ban rate
         win = _percent(parts[2]) if len(parts) > 2 else None
         pick = _percent(parts[4]) if len(parts) > 4 else 0.0
@@ -352,6 +369,33 @@ def format_meta_menu() -> str:
     )
 
 
+
+async def refresh_hero_custom_emojis():
+    """Пробует загрузить публичный набор Dota2heroicons из Telegram."""
+    try:
+        sticker_set = await bot.get_sticker_set(name="Dota2heroicons")
+        for sticker in sticker_set.stickers:
+            custom_id = getattr(sticker, "custom_emoji_id", None)
+            emoji = getattr(sticker, "emoji", None)
+            if custom_id and emoji:
+                CUSTOM_EMOJI_BY_HERO.setdefault(emoji, custom_id)
+        log.info("Dota2heroicons: загружено %d custom emoji", len(CUSTOM_EMOJI_BY_HERO))
+    except Exception as e:
+        log.warning("Не удалось загрузить Dota2heroicons: %s", e)
+
+
+def hero_icon_markup(name: str) -> str:
+    trigger = {
+        "Witch Doctor": "🧙", "Shadow Shaman": "🧙‍♂️", "Lich": "☠️",
+        "Spirit Breaker": "👹", "Dazzle": "💀", "Elder Titan": "🗿",
+        "Crystal Maiden": "❄️", "Lion": "🦁", "Vengeful Spirit": "👻",
+        "Abaddon": "⚔️", "Pudge": "🪝", "Ancient Apparition": "🥶",
+        "Techies": "💣", "Grimstroke": "🎨", "Omniknight": "⚔️",
+    }.get(name)
+    custom_id = CUSTOM_EMOJI_BY_HERO.get(trigger) if trigger else None
+    return f'<tg-emoji emoji-id="{custom_id}">◉</tg-emoji>' if custom_id else "🔹"
+
+
 def format_position_meta(position: str) -> str:
     cfg = POSITION_META.get(position)
     rows = CACHE["position_meta"].get(position, [])[:15]
@@ -366,7 +410,7 @@ def format_position_meta(position: str) -> str:
     ]
     for i, row in enumerate(rows, 1):
         lines.append(
-            f"{i}. <b>{row['name']}</b> — WR <b>{row['win']:.2f}%</b> · Pick {row['pick']:.2f}%"
+            f"{i}. {hero_icon_markup(row['name'])} <b>{row['name']}</b> — WR <b>{row['win']:.2f}%</b> · Pick {row['pick']:.2f}%"
         )
     lines.append("")
     lines.append("📊 Данные обновляются автоматически.")
@@ -686,6 +730,7 @@ async def cb_hero(callback: CallbackQuery):
 async def main():
     log.info("Загружаю данные из OpenDota...")
     await refresh_cache()
+    await refresh_hero_custom_emojis()
     asyncio.create_task(periodic_refresh())
     log.info("Бот запущен, жду сообщений...")
     await dp.start_polling(bot)
