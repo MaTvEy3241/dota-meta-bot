@@ -22,6 +22,7 @@ import logging
 import os
 import difflib
 from typing import Optional
+from bs4 import BeautifulSoup
 
 import aiohttp
 from PIL import Image, ImageDraw, ImageFont
@@ -44,7 +45,11 @@ OPENDOTA_BASE = "https://api.opendota.com/api"
 # Иконки предметов отдаёт CDN самого Steam/Dota 2, а не OpenDota.
 CDN_BASE = "https://cdn.cloudflare.steamstatic.com"
 # Некоторые запросы к CDN Steam блокируют запросы без User-Agent.
-HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; DotaMetaBot/1.0)"}
+HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/153.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not BOT_TOKEN:
@@ -89,16 +94,19 @@ CACHE = {
     "items": {},           # item_id -> {"dname": str, "img_url": str}
     "hero_stats": {},      # hero_id -> запись из /heroStats
     "patch_name": "неизвестен",
+    "position_meta": {},
 }
+POSITION_META = {
+    "pos5": {"label": "🛡️ Саппорт 5", "short": "Позиция 5", "dotabuff_position": "support-safe"},
+    "pos4": {"label": "⚡ Саппорт 4", "short": "Позиция 4", "dotabuff_position": "support-off"},
+    "carry": {"label": "🏹 Изи лейн", "short": "Позиция 1 / Carry", "dotabuff_position": "safe"},
+    "mid": {"label": "🧠 Мид", "short": "Позиция 2 / Mid", "dotabuff_position": "mid"},
+    "offlane": {"label": "💪 Хард лейн", "short": "Позиция 3 / Offlane", "dotabuff_position": "offlane"},
+}
+DOTABUFF_HERO_URL = "https://www.dotabuff.com/heroes"
+
 
 ICON_CACHE = {}  # item_id -> готовая (обрезанная) иконка (PIL.Image)
-
-ATTR_RU = {
-    "str": "💪 Сила",
-    "agi": "🏹 Ловкость",
-    "int": "🧠 Интеллект",
-    "all": "🌈 Универсальный",
-}
 
 # Скобки ММР в OpenDota heroStats: 1=Herald .. 8=Immortal.
 # Для "реальной высокоуровневой меты" берём Divine(7) + Immortal(8).
@@ -122,46 +130,108 @@ async def refresh_cache():
     async with aiohttp.ClientSession() as session:
         try:
             heroes = await fetch_json(session, f"{OPENDOTA_BASE}/heroes")
+            CACHE["heroes"].clear()
+            CACHE["name_to_id"].clear()
             for h in heroes:
                 CACHE["heroes"][h["id"]] = h
                 CACHE["name_to_id"][h["localized_name"].lower()] = h["id"]
-            log.info("Загружено героев: %d", len(heroes))
         except Exception as e:
             log.error("Не удалось загрузить героев: %s", e)
-
         try:
             items = await fetch_json(session, f"{OPENDOTA_BASE}/constants/items")
-            id_map = {}
+            CACHE["items"] = {}
             for internal_name, data in items.items():
                 if "id" not in data:
                     continue
                 img = data.get("img")
-                if not img:
-                    img_url = None
-                elif img.startswith("http"):
-                    img_url = img  # уже полная ссылка
-                else:
-                    img_url = f"{CDN_BASE}{img}"
-                id_map[data["id"]] = {"dname": data.get("dname", internal_name), "img_url": img_url}
-            CACHE["items"] = id_map
-            log.info("Загружено предметов: %d", len(id_map))
+                img_url = None if not img else (img if img.startswith("http") else f"{CDN_BASE}{img}")
+                CACHE["items"][data["id"]] = {"dname": data.get("dname", internal_name), "img_url": img_url}
         except Exception as e:
             log.error("Не удалось загрузить предметы: %s", e)
-
         try:
             stats = await fetch_json(session, f"{OPENDOTA_BASE}/heroStats")
-            for s in stats:
-                CACHE["hero_stats"][s["id"]] = s
-            log.info("Загружена статистика героев: %d", len(stats))
+            CACHE["hero_stats"] = {x["id"]: x for x in stats}
         except Exception as e:
             log.error("Не удалось загрузить heroStats: %s", e)
-
         try:
             patches = await fetch_json(session, f"{OPENDOTA_BASE}/constants/patch")
             if patches:
                 CACHE["patch_name"] = patches[-1]["name"]
         except Exception as e:
             log.error("Не удалось загрузить список патчей: %s", e)
+        await refresh_position_meta(session)
+
+
+async def fetch_text(session, url: str) -> str:
+    async with session.get(url, headers=HTTP_HEADERS, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+        resp.raise_for_status()
+        return await resp.text()
+
+
+def parse_dotabuff_hero_table(html: str) -> list:
+    soup = BeautifulSoup(html, "html.parser")
+    table = soup.find("table")
+    if not table:
+        return []
+    headers = [x.get_text(" ", strip=True).lower() for x in table.find_all("th")]
+    def idx(*names):
+        for name in names:
+            for i, h in enumerate(headers):
+                if name in h:
+                    return i
+        return None
+    hero_i, matches_i, pick_i, win_i = idx("hero"), idx("matches"), idx("pick rate"), idx("win rate")
+    if hero_i is None:
+        return []
+    rows = []
+    for tr in table.find_all("tr"):
+        cells = tr.find_all("td")
+        if len(cells) <= hero_i:
+            continue
+        vals = [c.get_text(" ", strip=True) for c in cells]
+        name = vals[hero_i]
+        if not name:
+            continue
+        def pct(i):
+            if i is None or i >= len(vals):
+                return 0.0
+            try:
+                return float(vals[i].replace("%", "").replace(",", "."))
+            except ValueError:
+                return 0.0
+        def integer(i):
+            if i is None or i >= len(vals):
+                return 0
+            try:
+                return int(vals[i].replace(",", "").replace(" ", ""))
+            except ValueError:
+                return 0
+        win, pick, matches = pct(win_i), pct(pick_i), integer(matches_i)
+        if win:
+            rows.append({"name": name, "matches": matches, "pick": pick, "win": win})
+    rows.sort(key=lambda x: (x["win"], x["pick"], x["matches"]), reverse=True)
+    return rows
+
+
+async def refresh_position_meta(session):
+    result = {}
+    for key, cfg in POSITION_META.items():
+        url = (
+            f"{DOTABUFF_HERO_URL}?show=heroes&view=meta&mode=all-pick"
+            f"&date=7d&position={cfg['dotabuff_position']}"
+        )
+        try:
+            html = await fetch_text(session, url)
+            rows = parse_dotabuff_hero_table(html)
+            if rows:
+                result[key] = rows[:15]
+                log.info("DOTABUFF %s: %d heroes", key, len(rows))
+            else:
+                log.warning("DOTABUFF %s: empty table", key)
+        except Exception as e:
+            log.warning("DOTABUFF %s error: %s", key, e)
+    if result:
+        CACHE["position_meta"] = result
 
 
 async def periodic_refresh():
@@ -223,25 +293,31 @@ def find_hero_id(query: str) -> Optional[int]:
 # Текст меты
 # ---------------------------------------------------------------------------
 
-def format_meta_top(limit: int = 10) -> str:
-    rows = []
-    for hid, stat in CACHE["hero_stats"].items():
-        rates = compute_rates(stat, HIGH_SKILL_BRACKETS)
-        if not rates or rates["picks"] < 50:
-            continue
-        hero = CACHE["heroes"].get(hid, {})
-        rows.append((hero.get("localized_name", "?"), rates["winrate"], rates["picks"]))
+def format_meta_menu() -> str:
+    return (
+        "🎯 <b>DOTA 2 META ПО ПОЗИЦИЯМ</b>\n\n"
+        "Выбери позицию — покажу TOP-15 героев по актуальной статистике DOTABUFF."
+    )
 
-    rows.sort(key=lambda r: r[1], reverse=True)
-    top = rows[:limit]
 
+def format_position_meta(position: str) -> str:
+    cfg = POSITION_META.get(position)
+    rows = CACHE["position_meta"].get(position, [])[:15]
+    if not cfg:
+        return "Неизвестная позиция."
+    if not rows:
+        return f"{cfg['label']}\n\n❌ Не удалось получить статистику DOTABUFF. Попробуй позже."
     lines = [
-        f"📊 <b>Топ меты (Divine/Immortal), патч {CACHE['patch_name']}</b>",
-        "<i>сортировка по винрейту, минимум 50 игр в выборке</i>",
+        f"{cfg['label']} — <b>TOP {len(rows)}</b>",
+        f"<i>{cfg['short']} · DOTABUFF · последние 7 дней · All Pick</i>",
         "",
     ]
-    for i, (name, wr, picks) in enumerate(top, 1):
-        lines.append(f"{i}. <b>{name}</b> — {wr:.1f}% винрейт ({picks} игр)")
+    for i, row in enumerate(rows, 1):
+        lines.append(
+            f"{i}. <b>{row['name']}</b> — WR <b>{row['win']:.2f}%</b> · Pick {row['pick']:.2f}%"
+        )
+    lines.append("")
+    lines.append("📊 Данные обновляются автоматически.")
     return "\n".join(lines)
 
 
@@ -256,7 +332,7 @@ def format_hero_caption(hero_id: int) -> str:
     pro = compute_pro_rates(stat)
 
     lines = [
-        f"🦸 <b>{hero['localized_name']}</b> ({ATTR_RU.get(hero.get('primary_attr'), hero.get('primary_attr'))})",
+        f"🦸 <b>{hero['localized_name']}</b>",
         f"Патч: {CACHE['patch_name']}",
         "",
     ]
@@ -388,29 +464,24 @@ async def build_purchase_image(hero_id: int, items_per_phase: int = 4):
 # Клавиатуры выбора героя по кнопкам
 # ---------------------------------------------------------------------------
 
-def attrs_keyboard() -> InlineKeyboardMarkup:
+def position_meta_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    for attr, label in ATTR_RU.items():
-        kb.button(text=label, callback_data=f"attr:{attr}")
-    kb.adjust(2)
+    for key, cfg in POSITION_META.items():
+        kb.button(text=cfg["label"], callback_data=f"posmeta:{key}")
+    kb.adjust(1)
     return kb.as_markup()
 
 
-def heroes_by_attr_keyboard(attr: str) -> InlineKeyboardMarkup:
+def position_back_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    heroes = [h for h in CACHE["heroes"].values() if h.get("primary_attr") == attr]
-    heroes.sort(key=lambda h: h["localized_name"])
-    for h in heroes:
-        kb.button(text=h["localized_name"], callback_data=f"hero:{h['id']}")
-    kb.adjust(3)
-    kb.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:attrs"))
+    kb.button(text="⬅️ К позициям", callback_data="menu:positions")
     return kb.as_markup()
 
 
 def hero_card_keyboard(hero_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="🔄 Обновить", callback_data=f"hero:{hero_id}")
-    kb.button(text="⬅️ К списку героев", callback_data="menu:attrs_new")
+    kb.button(text="⬅️ К позициям", callback_data="menu:positions")
     kb.adjust(2)
     return kb.as_markup()
 
@@ -435,10 +506,7 @@ async def cmd_start(message: Message):
 
 @dp.message(Command("meta"))
 async def cmd_meta(message: Message):
-    if not CACHE["hero_stats"]:
-        await message.answer("Данные ещё загружаются, попробуй через несколько секунд.")
-        return
-    await message.answer(format_meta_top(), parse_mode="HTML")
+    await message.answer(format_meta_menu(), parse_mode="HTML", reply_markup=position_meta_keyboard())
 
 
 @dp.message(Command("debug"))
@@ -459,7 +527,7 @@ async def cmd_debug(message: Message):
 
 @dp.message(Command("heroes"))
 async def cmd_heroes(message: Message):
-    await message.answer("Выбери атрибут героя:", reply_markup=attrs_keyboard())
+    await message.answer(format_meta_menu(), parse_mode="HTML", reply_markup=position_meta_keyboard())
 
 
 @dp.message(Command("hero"))
@@ -506,26 +574,23 @@ async def send_hero_card(message: Message, hero_id: int):
     )
 
 
-@dp.callback_query(F.data == "menu:attrs")
-async def cb_menu_attrs(callback: CallbackQuery):
-    await callback.message.edit_text("Выбери атрибут героя:", reply_markup=attrs_keyboard())
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "menu:attrs_new")
-async def cb_menu_attrs_new(callback: CallbackQuery):
-    # Карточка героя — это фото-сообщение, редактировать его в текстовое нельзя,
-    # поэтому отправляем новое сообщение со списком атрибутов.
-    await callback.message.answer("Выбери атрибут героя:", reply_markup=attrs_keyboard())
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("attr:"))
-async def cb_attr(callback: CallbackQuery):
-    attr = callback.data.split(":", 1)[1]
+@dp.callback_query(F.data == "menu:positions")
+async def cb_menu_positions(callback: CallbackQuery):
     await callback.message.edit_text(
-        f"{ATTR_RU.get(attr, attr)} — выбери героя:",
-        reply_markup=heroes_by_attr_keyboard(attr),
+        format_meta_menu(),
+        parse_mode="HTML",
+        reply_markup=position_meta_keyboard(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("posmeta:"))
+async def cb_position_meta(callback: CallbackQuery):
+    position = callback.data.split(":", 1)[1]
+    await callback.message.edit_text(
+        format_position_meta(position),
+        parse_mode="HTML",
+        reply_markup=position_back_keyboard(),
     )
     await callback.answer()
 
