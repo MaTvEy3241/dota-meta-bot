@@ -21,6 +21,7 @@ import io
 import logging
 import os
 import difflib
+import re
 from typing import Optional
 from bs4 import BeautifulSoup
 
@@ -247,7 +248,14 @@ def parse_dotabuff_hero_table(content: str) -> list:
         parts = [p.strip() for p in line.strip("|").split("|")]
         if len(parts) < 5:
             continue
-        name = BeautifulSoup(parts[0], "html.parser").get_text(" ", strip=True)
+        # Jina Reader иногда превращает ячейку Hero в Markdown-ссылку с
+        # картинкой. В Telegram нам нужно оставить только название героя.
+        raw_name = parts[0]
+        raw_name = re.sub(r"!\[([^]]*)\]\([^)]*\)", r"\1", raw_name)
+        raw_name = re.sub(r"\[([^]]+)\]\([^)]*\)", r"\1", raw_name)
+        raw_name = re.sub(r"https?://\S+", "", raw_name)
+        raw_name = re.sub(r"^Image\s*\d+\s*:\s*", "", raw_name, flags=re.IGNORECASE)
+        name = BeautifulSoup(raw_name, "html.parser").get_text(" ", strip=True).strip()
         # Обычно: Hero | Tier | Win rate | Change | Pick rate | Change | Ban rate
         win = _percent(parts[2]) if len(parts) > 2 else None
         pick = _percent(parts[4]) if len(parts) > 4 else 0.0
