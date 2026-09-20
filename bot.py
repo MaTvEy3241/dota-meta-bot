@@ -104,6 +104,7 @@ POSITION_META = {
     "offlane": {"label": "💪 Хард лейн", "short": "Позиция 3 / Offlane", "dotabuff_position": "offlane"},
 }
 DOTABUFF_HERO_URL = "https://www.dotabuff.com/heroes"
+DOTABUFF_PROXY = "https://r.jina.ai/http://www.dotabuff.com/heroes"
 
 
 ICON_CACHE = {}  # item_id -> готовая (обрезанная) иконка (PIL.Image)
@@ -163,53 +164,96 @@ async def refresh_cache():
 
 
 async def fetch_text(session, url: str) -> str:
-    async with session.get(url, headers=HTTP_HEADERS, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+    # Сначала пробуем сам DOTABUFF. Если сервер бота получает Cloudflare/403,
+    # используем Jina Reader как прозрачный текстовый прокси к той же странице.
+    try:
+        async with session.get(
+            url,
+            headers=HTTP_HEADERS,
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            if resp.status < 400:
+                text = await resp.text()
+                if len(text) > 5000:
+                    return text
+            log.warning("DOTABUFF direct request returned HTTP %s", resp.status)
+    except Exception as e:
+        log.warning("DOTABUFF direct request failed: %s", e)
+
+    proxy_url = "https://r.jina.ai/http://" + url.removeprefix("https://")
+    async with session.get(
+        proxy_url,
+        headers={"User-Agent": "DotaMetaBot/1.0"},
+        timeout=aiohttp.ClientTimeout(total=45),
+    ) as resp:
         resp.raise_for_status()
         return await resp.text()
 
 
-def parse_dotabuff_hero_table(html: str) -> list:
-    soup = BeautifulSoup(html, "html.parser")
-    table = soup.find("table")
-    if not table:
-        return []
-    headers = [x.get_text(" ", strip=True).lower() for x in table.find_all("th")]
-    def idx(*names):
-        for name in names:
-            for i, h in enumerate(headers):
-                if name in h:
-                    return i
+def _percent(value: str) -> Optional[float]:
+    try:
+        return float(value.replace("%", "").replace(",", ".").strip())
+    except (TypeError, ValueError):
         return None
-    hero_i, matches_i, pick_i, win_i = idx("hero"), idx("matches"), idx("pick rate"), idx("win rate")
-    if hero_i is None:
-        return []
+
+
+def _number(value: str) -> int:
+    try:
+        return int(value.replace(",", "").replace(" ", "").strip())
+    except (TypeError, ValueError):
+        return 0
+
+
+def parse_dotabuff_hero_table(content: str) -> list:
+    # Вариант 1: настоящий HTML DOTABUFF.
+    soup = BeautifulSoup(content, "html.parser")
+    table = soup.find("table")
+    if table:
+        headers = [x.get_text(" ", strip=True).lower() for x in table.find_all("th")]
+        def idx(*names):
+            for name in names:
+                for i, h in enumerate(headers):
+                    if name in h:
+                        return i
+            return None
+        hero_i = idx("hero")
+        matches_i = idx("matches")
+        pick_i = idx("pick rate")
+        win_i = idx("win rate")
+        if hero_i is not None:
+            rows = []
+            for tr in table.find_all("tr"):
+                cells = tr.find_all("td")
+                if len(cells) <= hero_i:
+                    continue
+                vals = [c.get_text(" ", strip=True) for c in cells]
+                name = vals[hero_i]
+                if not name:
+                    continue
+                win = _percent(vals[win_i]) if win_i is not None and win_i < len(vals) else None
+                pick = _percent(vals[pick_i]) if pick_i is not None and pick_i < len(vals) else 0.0
+                matches = _number(vals[matches_i]) if matches_i is not None and matches_i < len(vals) else 0
+                if win is not None:
+                    rows.append({"name": name, "matches": matches, "pick": pick or 0.0, "win": win})
+            if rows:
+                return rows
+
+    # Вариант 2: Jina Reader возвращает Markdown/обычный текст.
     rows = []
-    for tr in table.find_all("tr"):
-        cells = tr.find_all("td")
-        if len(cells) <= hero_i:
+    for line in content.splitlines():
+        line = line.strip()
+        if not line.startswith("|") or "Hero" in line or "---" in line:
             continue
-        vals = [c.get_text(" ", strip=True) for c in cells]
-        name = vals[hero_i]
-        if not name:
+        parts = [p.strip() for p in line.strip("|").split("|")]
+        if len(parts) < 5:
             continue
-        def pct(i):
-            if i is None or i >= len(vals):
-                return 0.0
-            try:
-                return float(vals[i].replace("%", "").replace(",", "."))
-            except ValueError:
-                return 0.0
-        def integer(i):
-            if i is None or i >= len(vals):
-                return 0
-            try:
-                return int(vals[i].replace(",", "").replace(" ", ""))
-            except ValueError:
-                return 0
-        win, pick, matches = pct(win_i), pct(pick_i), integer(matches_i)
-        if win:
-            rows.append({"name": name, "matches": matches, "pick": pick, "win": win})
-    rows.sort(key=lambda x: (x["win"], x["pick"], x["matches"]), reverse=True)
+        name = BeautifulSoup(parts[0], "html.parser").get_text(" ", strip=True)
+        # Обычно: Hero | Tier | Win rate | Change | Pick rate | Change | Ban rate
+        win = _percent(parts[2]) if len(parts) > 2 else None
+        pick = _percent(parts[4]) if len(parts) > 4 else 0.0
+        if name and win is not None:
+            rows.append({"name": name, "matches": 0, "pick": pick or 0.0, "win": win})
+
     return rows
 
 
